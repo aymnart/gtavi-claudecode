@@ -133,31 +133,48 @@ def twitch_login(url):
 
 class Recorder:
     def __init__(self, ld, url, minutes):
-        self.ld, self.csv = ld, ld / "segments.csv"
-        r = run(ytdlp_base() + ["-g", "-f", "b[height<=720]/bv*[height<=720]+ba/b", url], capture=True)
-        urls = [u for u in r.stdout.split() if u.startswith("http")]
-        if not urls:
-            sys.exit("could not get a stream URL (is the video live?)")
-        cmd = [tool("ffmpeg"), "-y", "-loglevel", "warning"]
-        for u in urls:
-            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-i", u]
-        for i in range(len(urls)):
-            cmd += ["-map", str(i)]
-        cmd += ["-c", "copy", "-t", str(int(minutes * 60)), "-f", "segment", "-segment_time", "60",
-                "-segment_format", "mpegts", "-reset_timestamps", "1", "-segment_list", str(self.csv),
-                "-segment_list_type", "csv", str(ld / "seg_%05d.ts")]
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        self.ld, self.csv, self.src_proc = ld, ld / "segments.csv", None
+        fmt = "b[height<=720]/bv*[height<=720]+ba/b"
+        seg_args = ["-c", "copy", "-t", str(int(minutes * 60)), "-f", "segment", "-segment_time", "30",
+                    "-segment_format", "mpegts", "-reset_timestamps", "1", "-segment_list", str(self.csv),
+                    "-segment_list_type", "csv", str(ld / "seg_%05d.ts")]
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if twitch_login(url):
+            # Pipe through yt-dlp so Twitch HLS playlist reloads and pre-roll/mid-roll ad discontinuities don't stall ffmpeg.
+            self.src_proc = subprocess.Popen(ytdlp_base() + ["--no-warnings", "-f", fmt, "-o", "-", url],
+                                             stdout=subprocess.PIPE, creationflags=flags)
+            cmd = [tool("ffmpeg"), "-y", "-loglevel", "warning", "-fflags", "+genpts+discardcorrupt",
+                   "-i", "pipe:0", "-map", "0:v?", "-map", "0:a?"] + seg_args
+            self.proc = subprocess.Popen(cmd, stdin=self.src_proc.stdout, creationflags=flags)
+            self.src_proc.stdout.close()
+        else:
+            r = run(ytdlp_base() + ["-g", "-f", fmt, url], capture=True)
+            urls = [u for u in r.stdout.split() if u.startswith("http")]
+            if not urls:
+                sys.exit("could not get a stream URL (is the video live?)")
+            cmd = [tool("ffmpeg"), "-y", "-loglevel", "warning", "-fflags", "+discardcorrupt"]
+            for u in urls:
+                cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-i", u]
+            for i in range(len(urls)):
+                cmd += ["-map", f"{i}:v?", "-map", f"{i}:a?"]
+            cmd += seg_args
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, creationflags=flags)
         self.t0 = None
 
     def alive(self):
         return self.proc.poll() is None
 
     def stop(self):
+        if self.src_proc and self.src_proc.poll() is None:
+            self.src_proc.terminate()
+            try: self.src_proc.wait(5)
+            except subprocess.TimeoutExpired: self.src_proc.kill()
         if self.alive():
-            try:
-                self.proc.stdin.write(b"q\n"); self.proc.stdin.flush()
-            except OSError:
-                pass
+            if self.src_proc is None and self.proc.stdin:
+                try:
+                    self.proc.stdin.write(b"q\n"); self.proc.stdin.flush()
+                except OSError:
+                    pass
             try:
                 self.proc.wait(20)
             except subprocess.TimeoutExpired:
